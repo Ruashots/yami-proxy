@@ -184,6 +184,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             content = m.get("content", "")
             
             if role == "system":
+                system_prompt += "\n\n--- Clawdbot Context ---\n" + content
                 continue
             
             if isinstance(content, list):
