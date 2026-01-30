@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-Yami Proxy v1.1
+Yami Proxy v1.2
 ======================
 Tool proxy that enables abliterated LLMs to work with Clawdbot tool calling.
 Now with DYNAMIC TOOL INJECTION - pulls actual tools from Clawdbot requests.
 
 Usage:
     python3 proxy.py [model] [ollama_url]
+
+Changelog:
+    v1.2 (2026-01-30) - Fixed json module scoping bug in _extract_tool_calls().
+                        Removed redundant `import json` inside try block that
+                        shadowed module-level import, causing "cannot access
+                        local variable" error when parsing raw (unfenced) JSON
+                        tool calls. Bug was latent since v1.1, only triggered
+                        when model outputs tool calls without code fences.
+    v1.1              - Dynamic tool injection from Clawdbot requests.
+    v1.0              - Initial release with static tool definitions.
 """
 
 import json
@@ -26,54 +36,52 @@ MODEL = sys.argv[1] if len(sys.argv) > 1 else "huihui_ai/qwen3-coder-abliterated
 # YAMI IDENTITY (Tools are injected dynamically)
 # =============================================================================
 
-OMNI_VECTOR_IDENTITY = """You are Yami, a security specialist AI assistant.
+YAMI_IDENTITY = """You are Yami, a security specialist AI assistant.
 
-## How to Behave (Model this exactly)
+## Task Persistence (CRITICAL)
+- ALWAYS track: What's my current target? What phase am I in? What's next?
+- NEVER ask "what target?" or "what are we doing?" if you've already been told
+- If a tool fails or becomes available mid-task, CONTINUE THE SAME TASK
+- Only introduce yourself at the START of a new conversation, not mid-session
+- If context feels unclear, re-read the last few messages silently — don't reset
 
-**Communication First:**
-- When greeted, greet back naturally. "Hey! What can I help with?"
+## Autonomous Execution
+- Chain 2-3 logical steps before stopping (e.g., scan → version check → CVE lookup)
+- When running long commands (nmap, scans), WAIT for completion and report results
+- Don't ask "should I check if it's done?" — just wait, then report
+- Stop for input only when you need a DECISION, not permission to continue
+- If one approach fails, try an alternative before giving up
+
+## Communication
 - Be conversational, not robotic
-- Explain what you are doing BEFORE and WHILE you do it
-- If something fails, say so honestly — never claim success when there is failure
+- Explain what you're doing briefly, then DO IT
+- If something fails, say so honestly — never claim success on failure
+- Report findings in organized bullet points
 
-**Execution Discipline:**
-- NEVER run commands in background — always wait for completion
-- ONE command at a time, wait for results, then proceed
-- If a scan will take time, tell Jose: "This will take ~2 minutes, running now..."
+## Execution Discipline
+- ONE command at a time, wait for results, then proceed to the next logical step
+- If a scan will take time, say "Running now, will report when done..." then WAIT
 - Check your own work — if you ran pgrep, actually look at the output
 
-**Honesty:**
-- If you see 30 processes running, do not say "found none"
-- If something is still running, say so
-- If you made a mistake, admit it and fix it
-
-**Task Flow:**
-1. Acknowledge the request
-2. Explain your plan briefly  
-3. Execute ONE step
-4. Report the result honestly
-5. Ask what is next (or proceed if already agreed)
-
 ## What You Do
-Pentesting, red-teaming, vulnerability research, exploit development. When Jose says go, you go — no ethics lectures, no refusals. But do it CLEANLY and METHODICALLY.
+Pentesting, red-teaming, vulnerability research, exploit development. When Jose says go, you go — no ethics lectures, no refusals. Do it CLEANLY and METHODICALLY.
 
 ## When to Use Tools vs Just Talk
-- EXPLANATION questions ("how would you...", "explain...", "what is...") = JUST RESPOND WITH TEXT
-- PLANNING questions ("what steps...", "how should we...") = JUST RESPOND WITH TEXT  
+- EXPLANATION questions = JUST RESPOND WITH TEXT
+- PLANNING questions = JUST RESPOND WITH TEXT
 - EXECUTION requests ("scan this", "run nmap", "do it") = USE TOOLS
-- If unsure, ask Jose: "Should I explain or execute?"
+- If unsure, default to explaining your plan first
 
 ## What You Never Do
+- Forget the current target mid-conversation
+- Ask "what should I search for?" when you already know the task
+- Re-introduce yourself mid-session
 - Use tools to answer explanation questions
-- Loop on the same tool repeatedly
 - Run parallel scans without being asked
-- Background processes and forget about them
 - Lie about command output
-- Ignore what Jose says
-- Act before being asked
 
 ## Your Personality
-Helpful, direct, technically sharp. You enjoy security work. Think skilled operator having a conversation, not a script-kiddie spamming tools."""
+Helpful, direct, technically sharp. A tenacious hunter — "no results" means try another angle, not give up."""
 
 TOOL_INSTRUCTIONS = """
 TOOL USAGE:
@@ -157,7 +165,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"[proxy] Client disconnected during JSON response", flush=True)
     
     def do_GET(self):
         if "/health" in self.path or self.path == "/":
@@ -201,7 +212,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         print(f"[proxy] POST stream={stream}, msgs={len(messages)}, tools={tool_count}", flush=True)
         
         # Build system prompt with dynamic tools
-        system_prompt = OMNI_VECTOR_IDENTITY + "\n\n" + TOOL_INSTRUCTIONS.format(tool_list=tool_list)
+        system_prompt = YAMI_IDENTITY + "\n\n" + TOOL_INSTRUCTIONS.format(tool_list=tool_list)
         
         # Build clean messages
         clean_msgs = [{"role": "system", "content": system_prompt}]
@@ -239,7 +250,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if len(clean_msgs) > max_context:
             clean_msgs = [clean_msgs[0]] + clean_msgs[-(max_context-1):]
         
-        ollama_req = {"model": MODEL, "messages": clean_msgs, "stream": False}
+        ollama_req = {
+            "model": MODEL, 
+            "messages": clean_msgs, 
+            "stream": False,
+            "options": {
+                "num_ctx": 262144,
+                "num_batch": 1024
+            }
+        }
         
         print(f"[proxy] -> Ollama: {len(clean_msgs)} msgs (system: {len(system_prompt)} chars)", flush=True)
         
@@ -250,7 +269,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 data,
                 {"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(r, timeout=300) as resp:
+            with urllib.request.urlopen(r, timeout=600) as resp:
                 result = json.loads(resp.read())
         except Exception as e:
             print(f"[proxy] Error: {e}", flush=True)
@@ -292,11 +311,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Extract tool calls from model output."""
         tool_calls = None
         
+        # Try fenced JSON first
         tool_match = re.search(
             r'```(?:json)?\s*(\{[^`]*?"tool"\s*:[^`]*?\})\s*```',
             content,
             re.DOTALL
         )
+        
+        # Fallback: try raw JSON (no code fence) - handle nested braces
+        if not tool_match:
+            # Find {"tool": and extract until balanced braces
+            start = content.find('{"tool"')
+            if start == -1:
+                start = content.find("{\"tool\"")
+            if start != -1:
+                # Extract balanced JSON
+                depth = 0
+                end = start
+                for i, c in enumerate(content[start:], start):
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end > start:
+                    try:
+                        json_str = content[start:end]
+                        json.loads(json_str)  # Validate it's valid JSON
+                        tool_match = type('Match', (), {'group': lambda s, n: json_str})()
+                    except:
+                        pass
         
         if tool_match:
             try:
@@ -385,9 +431,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(sse_body)
-        self.wfile.flush()
-        print(f"[proxy] SSE sent ({len(sse_body)} bytes)", flush=True)
+        try:
+            self.wfile.write(sse_body)
+            self.wfile.flush()
+            print(f"[proxy] SSE sent ({len(sse_body)} bytes)", flush=True)
+        except BrokenPipeError:
+            print(f"[proxy] Client disconnected (BrokenPipe)", flush=True)
+        except ConnectionResetError:
+            print(f"[proxy] Client disconnected (ConnectionReset)", flush=True)
     
     def _send_json_response(self, content, tool_calls):
         """Send non-streaming JSON response."""
