@@ -27,6 +27,28 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.request
 import urllib.error
 
+def repair_json_command(json_str):
+    """Try to fix unescaped quotes in command values."""
+    try:
+        # First try as-is
+        json.loads(json_str)
+        return json_str
+    except:
+        pass
+    # Try to fix command strings with unescaped quotes
+    # Find "command": "..." and escape internal quotes
+    import re
+    def fixer(m):
+        pre, cmd = m.group(1), m.group(2)
+        # Naive fix: replace " with \" inside command
+        fixed = cmd.replace(chr(34), chr(92)+chr(34))
+        return pre + fixed + chr(34)
+    pattern = r'("command"\s*:\s*")([^"]+)"'
+    fixed = re.sub(pattern, fixer, json_str)
+    return fixed
+
+
+
 # Configuration
 PORT = 4000
 OLLAMA_URL = sys.argv[2] if len(sys.argv) > 2 else "http://192.168.50.100:11434"
@@ -100,6 +122,7 @@ IMPORTANT RULES:
 3. Output the JSON block and NOTHING else when using a tool
 4. Wait for tool results before continuing
 5. If a tool fails, try an alternative approach
+6. ESCAPE double quotes in shell commands: use \" or single quotes
 
 EXAMPLES:
 - To run a command: ```json
@@ -298,9 +321,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             # Clean up excessive whitespace
             content = re.sub(r'\n{3,}', '\n\n', content).strip()
-            # If only whitespace or very short after stripping, make it empty
-            if len(content) < 3:
-                content = ""
+            # If only whitespace or very short after stripping, add placeholder
+            if len(content) < 3 and not tool_calls:
+                content = "[Processing...]"  # Prevent silent stops
         
         if stream:
             self._send_sse_response(content, tool_calls)
@@ -339,7 +362,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if end > start:
                     try:
                         json_str = content[start:end]
-                        json.loads(json_str)  # Validate it's valid JSON
+                        json_str = repair_json_command(json_str)  # Try to fix malformed JSON
+                        json.loads(json_str)  # Validate
                         tool_match = type('Match', (), {'group': lambda s, n: json_str})()
                     except:
                         pass
