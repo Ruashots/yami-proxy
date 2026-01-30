@@ -217,7 +217,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 clean_msgs.append({"role": role, "content": str(content)})
         
         # Keep system + last N messages
-        max_context = 50
+        max_context = 500
         if len(clean_msgs) > max_context:
             clean_msgs = [clean_msgs[0]] + clean_msgs[-(max_context-1):]
         
