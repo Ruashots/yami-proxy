@@ -1,0 +1,21 @@
+# Logs
+*.log
+proxy.log
+
+# Sessions and state
+*.session
+*.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# Local configs with secrets
+litellm_config.yaml
+
+# Test files
+test.txt
+Master_IP.txt
+
+# Secure ops experiments (keep separate)
+secure_ops/
